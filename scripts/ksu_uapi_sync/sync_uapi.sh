@@ -99,47 +99,59 @@ if not main_ver:
 
 changed = []
 
-# 1) 按官方原文移植 builtin 缺失的 static const 常量（含抬升后的
-#    KERNEL_SU_UAPI_VERSION、EVENT_*、KSU_GET_INFO_FLAG_*、新 ioctl 常量、
-#    KSU_LOOKUP_SYMBOLS_MAX 等）。
+# 1) 按官方值移植 builtin 缺失的常量（含抬升后的 KERNEL_SU_UAPI_VERSION、
+#    EVENT_*、KSU_GET_INFO_FLAG_*、新 ioctl 常量、KSU_LOOKUP_SYMBOLS_MAX 等）。
+#    声明形式跟随 builtin 现有的 DECLARE 宏（非 BINDGEN 下展开为 enum，
+#    是编译期常量，dispatch.c 的 static 处理表才能引用；main 的 static const
+#    形式在 builtin 的 static 初始化器上下文会报
+#    "initializer element is not a compile-time constant"）。
 #    逐常量移植而非整文件替换：builtin 头还有独立演化内容
 #    （DECLARE 宏、__user 注记的 ksu_kpm_cmd 等），整替换会互相覆盖。
-decl_re = re.compile(r"^static const [^\n]+?=\s*[^;\n]+;", re.M)
-main_decls = {}
-for m in decl_re.finditer(main):
-    line = m.group(0)
-    name = re.match(r"static const \w[\w\s\*]*?\b(\w+)\s*=", line)
-    if name:
-        main_decls.setdefault(name.group(1), line)
+def parse_decls(text):
+    decls = {}
+    for m in re.finditer(r"^static const (\w[\w\s\*]*?)\b(\w+)\s*=\s*([^;\n]+);", text, re.M):
+        decls.setdefault(m.group(2), (m.group(1), m.group(3)))
+    return decls
 
-inserted_before = None
-for name, line in main_decls.items():
-    if re.search(r"\b" + re.escape(name) + r"\b", uapi):
-        continue
-    if inserted_before is None:
-        # 首个缺失常量统一插在 flag 区块之后，保持声明集中
-        anchor = re.search(r"(DECLARE\(__u32, KSU_GET_INFO_FLAG_PR_BUILD[^\n]*\n|static const __u32 KSU_GET_INFO_FLAG_PR_BUILD[^\n]*\n)", uapi)
-        if not anchor:
-            anchor = re.search(r"(DECLARE\(__u32, KERNEL_SU_UAPI_VERSION[^\n]*\n|static const __u32 KERNEL_SU_UAPI_VERSION[^\n]*\n)", uapi)
-        if not anchor:
-            print("::error::builtin supercall.h 缺少常量插入锚点（UAPI/FLAG 区块）")
-            sys.exit(1)
-        inserted_before = anchor.end()
-        uapi = uapi[:inserted_before] + "\n// synced from SukiSU-Ultra main uapi/supercall.h (dynamic UAPI sync)\n" + uapi[inserted_before:]
-        inserted_before += len("\n// synced from SukiSU-Ultra main uapi/supercall.h (dynamic UAPI sync)\n")
-    uapi = uapi[:inserted_before] + line + "\n" + uapi[inserted_before:]
-    inserted_before += len(line) + 1
-    changed.append(name)
+main_decls = parse_decls(main)
+has_declare = "#define DECLARE" in uapi
 
 # 2) 移植 builtin 缺失的 struct 定义（如 ksu_lookup_symbols_cmd /
-#    ksu_set_spoof_cpu_cmd）。struct 不重复定义，按 struct 名检测。
+#    ksu_set_spoof_version_cmd）。struct 必须先于引用它的 _IOW 常量声明，
+#    且插入点需在 include guard 内（supercall.h 会被 ksu.c / dynamic_manager.c
+#    多次 include，文件尾 #endif 之外的内容每次 include 都会重复定义）。
 struct_re = re.compile(r"^struct (\w+) \{(?:[^{}])*?\};", re.M | re.S)
+main_structs = []
 for m in struct_re.finditer(main):
-    sname, text = m.group(1), m.group(0)
-    if re.search(r"struct\s+" + re.escape(sname) + r"\s*\{", uapi):
-        continue
-    uapi += "\n" + text + "\n"
+    main_structs.append((m.group(1), m.group(0)))
+
+missing_structs = [(n, t) for n, t in main_structs if not re.search(r"struct\s+" + re.escape(n) + r"\s*\{", uapi)]
+missing_decls = {n: v for n, v in main_decls.items() if not re.search(r"\b" + re.escape(n) + r"\b", uapi)}
+
+# 统一插入点：flag 区块之后（guard 内、DECLARE 宏之后、struct/常量使用之前）
+anchor = re.search(r"(DECLARE\(__u32, KSU_GET_INFO_FLAG_PR_BUILD[^\n]*\n|static const __u32 KSU_GET_INFO_FLAG_PR_BUILD[^\n]*\n)", uapi)
+if not anchor:
+    anchor = re.search(r"(DECLARE\(__u32, KERNEL_SU_UAPI_VERSION[^\n]*\n|static const __u32 KERNEL_SU_UAPI_VERSION[^\n]*\n)", uapi)
+if not anchor:
+    print("::error::builtin supercall.h 缺常量/struct 插入锚点（UAPI/FLAG 区块）")
+    sys.exit(1)
+pos = anchor.end()
+
+block = "\n// synced from SukiSU-Ultra main uapi/supercall.h (dynamic UAPI sync)\n"
+# struct 先插（同名的 _IOW 常量在插入块里引用它们）
+for sname, text in missing_structs:
+    block += text + "\n"
     changed.append("struct " + sname)
+for name, (ctype, value) in missing_decls.items():
+    if has_declare:
+        block += "DECLARE(%s, %s, %s);\n" % (ctype, name, value)
+    else:
+        block += "static const %s %s = %s;\n" % (ctype, name, value)
+    changed.append(name)
+if missing_decls:
+    block += "\n"
+
+uapi = uapi[:pos] + block + uapi[pos:]
 
 # 3) 抬升 UAPI 号到官方值
 if cur_ver is not None and cur_ver < main_ver:
