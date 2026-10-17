@@ -44,7 +44,23 @@ if [ "$KSU_VARIANT" == "FinaSU" ]; then
     fi
   fi
   if ! grep -q 'hook/lsm_hook.o' "$FINASU_KSU/Kbuild"; then
-    sed -i 's|^kernelsu-objs += hook/setuid_hook.o$|kernelsu-objs += hook/setuid_hook.o\nkernelsu-objs += hook/lsm_hook.o\nkernelsu-objs += infra/symbol_resolver.o\n\nifeq ($(CONFIG_ARM64),y)\nkernelsu-objs += hook/arm64/patch_memory.o\nelse ifeq ($(CONFIG_X86_64),y)\nkernelsu-objs += hook/x86_64/patch_memory.o\nelse ifeq ($(CONFIG_RISCV),y)\nkernelsu-objs += hook/riscv64/patch_memory.o\nendif|' "$FINASU_KSU/Kbuild"
+    sed -i 's|^kernelsu-objs += hook/setuid_hook.o$|kernelsu-objs += hook/setuid_hook.o\nkernelsu-objs += hook/lsm_hook.o\nkernelsu-objs += infra/symbol_resolver.o\n\nifeq ($(CONFIG_ARM64),y)\nkernelsu-objs += hook/arm64/patch_memory.o\nkernelsu-objs += hook/arm64/syscall_hook.o\nelse ifeq ($(CONFIG_X86_64),y)\nkernelsu-objs += hook/x86_64/patch_memory.o\nkernelsu-objs += hook/x86_64/syscall_hook.o\nelse ifeq ($(CONFIG_RISCV),y)\nkernelsu-objs += hook/riscv64/patch_memory.o\nkernelsu-objs += hook/riscv64/syscall_hook.o\nendif|' "$FINASU_KSU/Kbuild"
+  fi
+  # 0h) FinaSU 9d279c4 起 preinit.c（Kbuild 在目标 UAPI 头存在时始终编译）
+  #     引用 ksu_syscall_table，其定义 hook/<arch>/syscall_hook.c 被 SUSFS 补丁
+  #     移出了编译列表 → ThinLTO 链接报 undefined symbol。这里补回该编译单元
+  #     仅提供符号：init.c 不调用 ksu_syscall_hook_init()，syscall 表保持 NULL，
+  #     SUSFS 场景下 preinit 的 execve 桥（唯一调用方）也不参与编译，无运行时影响。
+  if ! grep -q 'hook/arm64/syscall_hook.o' "$FINASU_KSU/Kbuild"; then
+    sed -i 's|^kernelsu-objs += hook/arm64/patch_memory.o$|kernelsu-objs += hook/arm64/patch_memory.o\nkernelsu-objs += hook/arm64/syscall_hook.o|' "$FINASU_KSU/Kbuild"
+    sed -i 's|^kernelsu-objs += hook/x86_64/patch_memory.o$|kernelsu-objs += hook/x86_64/patch_memory.o\nkernelsu-objs += hook/x86_64/syscall_hook.o|' "$FINASU_KSU/Kbuild"
+    sed -i 's|^kernelsu-objs += hook/riscv64/patch_memory.o$|kernelsu-objs += hook/riscv64/patch_memory.o\nkernelsu-objs += hook/riscv64/syscall_hook.o|' "$FINASU_KSU/Kbuild"
+  fi
+  if ! grep -q 'hook/arm64/syscall_hook.o' "$FINASU_KSU/Kbuild" \
+    || ! grep -q 'hook/x86_64/syscall_hook.o' "$FINASU_KSU/Kbuild" \
+    || ! grep -q 'hook/riscv64/syscall_hook.o' "$FINASU_KSU/Kbuild"; then
+    echo "::error::FinaSU Kbuild 未恢复 hook/<arch>/syscall_hook.o（preinit 引用 ksu_syscall_table）" >&2
+    exit 1
   fi
 
   # 0b) SUSFS 内核补丁在 security/selinux/*.c 中以 extern 引用了这些符号，需与 BakaSU 一致
