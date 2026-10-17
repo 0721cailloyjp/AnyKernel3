@@ -322,25 +322,37 @@ PYEOF2
       echo "dispatch.c 已包含 do_lookup_symbols，跳过接线"
     fi
 
-    # ksud_integration.c 若存在（较新 builtin），resolver 初始化在 init 中调用
-    if ! grep -q 'ksu_init_symbol_resolver' "$KSU_DIR/kernel/ksu.c" 2>/dev/null; then
-      python3 - "$KSU_DIR/kernel/ksu.c" <<'PYEOF3'
+    # builtin 以 ksu.c unity build 编译（所有 .c 经 #include 聚合进 ksu.o），
+    # resolver 源码必须 #include 进 ksu.c，否则链接报 undefined symbol。
+    KSU_C="$KSU_DIR/kernel/ksu.c"
+    if [ -f "$KSU_C" ] && ! grep -q '#include "infra/symbol_resolver.c"' "$KSU_C"; then
+      sed -i 's|^#include "infra/event_queue.c"|#include "infra/event_queue.c"\n#include "infra/symbol_resolver.c"|' "$KSU_C" \
+        || fail "ksu.c include symbol_resolver.c 失败"
+      grep -q '#include "infra/symbol_resolver.c"' "$KSU_C" || fail "ksu.c symbol_resolver.c include 校验失败"
+      echo "ksu.c: #include infra/symbol_resolver.c 已接入（unity build）"
+    elif [ -f "$KSU_C" ]; then
+      echo "ksu.c 已包含 symbol_resolver.c include，跳过"
+    fi
+
+    # 初始化接线：resolver 的函数指针表需在 kernelsu_init 中初始化
+    if ! grep -q 'ksu_init_symbol_resolver' "$KSU_C" 2>/dev/null; then
+      python3 - "$KSU_C" <<'PYEOF3'
 import sys, re
 path = sys.argv[1]
 s = open(path, encoding="utf-8", errors="surrogateescape").read()
-decl = "extern void ksu_init_symbol_resolver(void);\n"
-if decl not in s:
-    s = decl + s
-anchor = "    ksu_supercalls_init();"
-if anchor in s:
-    s = s.replace(anchor, anchor + "\n\n    ksu_init_symbol_resolver();", 1)
-    open(path, "w", encoding="utf-8", errors="surrogateescape").write(s)
-    print("ksu.c: ksu_init_symbol_resolver() 已接入 kernelsu_init")
+if "ksu_init_symbol_resolver();" not in s:
+    anchor = "    ksu_supercalls_init();"
+    if anchor in s:
+        s = s.replace(anchor, anchor + "\n\n    ksu_init_symbol_resolver();", 1)
+        open(path, "w", encoding="utf-8", errors="surrogateescape").write(s)
+        print("ksu.c: ksu_init_symbol_resolver() 已接入 kernelsu_init")
+    else:
+        print("::warning::ksu.c 缺少 ksu_supercalls_init 锚点，resolver 初始化未接线（LOOKUP_SYMBOLS 将退化为未初始化 walker）")
 else:
-    print("::warning::ksu.c 缺少 ksu_supercalls_init 锚点，resolver 初始化未接线（LOOKUP_SYMBOLS 将退化为未初始化 walker）")
+    print("ksu.c 已包含 ksu_init_symbol_resolver() 调用，跳过")
 PYEOF3
     else
-      echo "ksu.c 已包含 ksu_init_symbol_resolver，跳过"
+      echo "ksu.c 已包含 ksu_init_symbol_resolver() 调用，跳过"
     fi
   fi
 else
