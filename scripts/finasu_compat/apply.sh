@@ -294,8 +294,82 @@ PYEOF
   if ! grep -q 'extern bool ksu_late_loaded;' "$FINASU_KSU_H"; then
     sed -i 's|^extern bool ksu_no_custom_rc;$|extern bool ksu_no_custom_rc;\nextern bool ksu_late_loaded;\nextern bool ksu_bundled;|' "$FINASU_KSU_H"
   fi
+  # 新形态（9d279c4 起）的 init.c 仍保留 MODULE 分支的 ksu_bundled 定义
+  # （上游补丁删除它的 hunk 因上下文漂移失败），此时只补 ksu_late_loaded，
+  # 否则会产生重复定义。
   if ! grep -q '^bool ksu_late_loaded;' "$FINASU_INIT"; then
-    sed -i 's|^struct cred \*ksu_cred;$|struct cred *ksu_cred;\n\nbool ksu_late_loaded;\n\n#ifdef MODULE\nbool ksu_bundled = false;\nmodule_param_named(bundled, ksu_bundled, bool, 0);\n#endif|' "$FINASU_INIT"
+    if grep -q '^bool ksu_bundled = false;' "$FINASU_INIT"; then
+      sed -i 's|^struct cred \*ksu_cred;$|struct cred *ksu_cred;\n\nbool ksu_late_loaded;|' "$FINASU_INIT"
+    else
+      sed -i 's|^struct cred \*ksu_cred;$|struct cred *ksu_cred;\n\nbool ksu_late_loaded;\n\n#ifdef MODULE\nbool ksu_bundled = false;\nmodule_param_named(bundled, ksu_bundled, bool, 0);\n#endif|' "$FINASU_INIT"
+    fi
+  fi
+
+  # 0f) FinaSU 9d279c4 起 userspace_stack_buffer 从 sucompat.c 挪到 util.h，
+  #     而 SUSFS 补丁删除了 sucompat.c 的 #include "util.h" / #include "ksu.h"，
+  #     导致 ksud_user_path/sh_user_path 调用未定义函数（-Wimplicit-function-declaration）。
+  #     这里在引用存在且无本地定义时补回 util.h。
+  FINASU_SUCOMPAT="$FINASU_KSU/feature/sucompat.c"
+  if [ -f "$FINASU_SUCOMPAT" ] && grep -q 'userspace_stack_buffer' "$FINASU_SUCOMPAT" \
+    && ! grep -q '^static void __user \*userspace_stack_buffer' "$FINASU_SUCOMPAT" \
+    && ! grep -q '#include "util.h"' "$FINASU_SUCOMPAT"; then
+    sed -i 's|^#include "objsec.h"$|#include "objsec.h"\n#include "util.h"|' "$FINASU_SUCOMPAT"
+  fi
+  if grep -q 'userspace_stack_buffer' "$FINASU_SUCOMPAT" \
+    && ! grep -q '^static void __user \*userspace_stack_buffer' "$FINASU_SUCOMPAT" \
+    && ! grep -q '#include "util.h"' "$FINASU_SUCOMPAT"; then
+    echo "::error::FinaSU sucompat.c 引用 userspace_stack_buffer 但 util.h 不可用，代码结构可能已变化" >&2
+    exit 1
+  fi
+
+  # 0g) SUSFS 补丁在 ksud_integration.c 的 4 个 static key 定义 hunk 因结构漂移失败，
+  #     但后续 hunk 已把这些 key 改为按引用使用（原 hook stop 逻辑）→ 未定义引用。
+  #     按被拒 hunk 1 的原意补回定义（含 linux/jump_label.h）。
+  if [ -f "$FINASU_KSI" ]; then
+    NEED_KEYS=""
+    for KEY in ksu_is_init_rc_hook_enabled ksu_is_input_hook_enabled is_init_second_stage_not_executed is_first_zygote; do
+      if grep -q "$KEY" "$FINASU_KSI" \
+        && ! grep -q "DEFINE_STATIC_KEY_TRUE($KEY)" "$FINASU_KSI" \
+        && ! grep -rn "DEFINE_STATIC_KEY_TRUE($KEY)" "$FINASU_KSU" --include="*.c" --include="*.h" > /dev/null 2>&1; then
+        NEED_KEYS="$NEED_KEYS$KEY\n"
+      fi
+    done
+    if [ -n "$NEED_KEYS" ]; then
+      if ! grep -q '#include "linux/jump_label.h"' "$FINASU_KSI"; then
+        sed -i 's|^#include <linux/rcupdate.h>$|#include <linux/rcupdate.h>\n#include "linux/jump_label.h"|' "$FINASU_KSI"
+      fi
+      python3 - "$FINASU_KSI" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+
+keys = ["ksu_is_init_rc_hook_enabled", "ksu_is_input_hook_enabled",
+        "is_init_second_stage_not_executed", "is_first_zygote"]
+defs = "".join("DEFINE_STATIC_KEY_TRUE(%s);\n" % k for k in keys
+               if "DEFINE_STATIC_KEY_TRUE(%s)" % k not in src)
+if defs:
+    anchor = "// clang-format off\n"
+    assert anchor in src, "ksud_integration.c: static key anchor not found"
+    src = src.replace(anchor, defs + "\n" + anchor, 1)
+    open(path, "w", encoding="utf-8").write(src)
+    print("ksud_integration.c: 已补回 %d 个 static key 定义" % len(defs.splitlines()))
+PYEOF
+    fi
+    # 跳转标签定义存在但头文件缺失时（上游补丁自带的定义 hunk 不带 include）也补上
+    if grep -q 'DEFINE_STATIC_KEY_TRUE' "$FINASU_KSI" \
+      && ! grep -q 'jump_label' "$FINASU_KSI" \
+      && grep -q '^#include <linux/rcupdate.h>$' "$FINASU_KSI"; then
+      sed -i 's|^#include <linux/rcupdate.h>$|#include <linux/rcupdate.h>\n#include "linux/jump_label.h"|' "$FINASU_KSI"
+      grep -n 'jump_label' "$FINASU_KSI" | head -1
+    fi
+    for KEY in ksu_is_init_rc_hook_enabled ksu_is_input_hook_enabled is_init_second_stage_not_executed is_first_zygote; do
+      if grep -q "$KEY" "$FINASU_KSI" \
+        && ! grep -rn "DEFINE_STATIC_KEY_TRUE($KEY)" "$FINASU_KSU" --include="*.c" --include="*.h" > /dev/null 2>&1; then
+        echo "::error::FinaSU ksud_integration.c 引用 static key $KEY 但定义缺失" >&2
+        exit 1
+      fi
+    done
   fi
 
   # 4a) 补齐新架构初始化函数的头文件声明
