@@ -270,6 +270,20 @@ PYEOF
   echo "services.c: 已提供 context_struct_compute_av_fn / security_dump_masked_av_fn"
 fi
 
+# ==================== KernelSU 缺失的 SUSFS 内联钩子符号（6.6+/6.12 主补丁形态）====================
+# 6.6/6.12 主补丁在 security/selinux/{hooks,selinuxfs}.c 内联改写调用点，要求 KernelSU 侧
+# 以全局符号提供 my_setprocattr / my_write_context / my_write_access；并在 fs/exec.c 调用
+# ksu_setup_preinit_file / ksu_preinit_handle_post_execveat（受 KSU_NO_PREINIT 开关控制）。
+# SukiSU-Ultra（builtin 5ef32ad / main 31255c4）两者都不提供，KPM+SUSFS 的 6.12 构建在
+# vmlinux 链接阶段报：
+#   ld.lld: error: undefined symbol: my_setprocattr / my_write_context / my_write_access
+#   ld.lld: error: undefined symbol: ksu_setup_preinit_file / ksu_preinit_handle_post_execveat
+# 处理：按 KernelSU 实际能力裁剪（SELinux 包装函数回落到内核原生处理函数、preinit 走主补丁
+# 自带开关），保留 SUSFS 其余功能；KernelSU 上游补齐后脚本按内容检测自动跳过，幂等。
+echo "按 KernelSU 实际能力裁剪 SUSFS 内联钩子..."
+python3 "$SCRIPT_DIR/ksu_susfs_hooks.py" "$KERNEL_ROOT" \
+  || { echo "::error::SUSFS 内联钩子裁剪失败"; exit 1; }
+
 # ==================== FinaSU 新 selinux_hide 模型适配 ====================
 # 自 FinaSU v0.1.0-preview1 起，kernel/feature/selinux_hide.c 换成了 tiann 新形态：
 #   移除 fake_state；统一用 backup_sepolicy + security_context_to_sid_with_policy(..., &orig_sid_p, &orig_rc_p)（8 参）；
