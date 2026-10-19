@@ -12,10 +12,14 @@
 
 处理：
   1) 缺少 my_* 全局实现时，删除对应 extern 声明，并把包装函数回落到内核原生处理函数
-     （node 等价于 CONFIG_KSU_SUSFS 未开启时的路径），SUSFS 其余功能不受影响；
+     （等价于 CONFIG_KSU_SUSFS 未开启时的路径），SUSFS 其余功能不受影响；
   2) 缺少 preinit 后端时，按主补丁自带的 KSU_NO_PREINIT 开关裁剪该路径。
 
-所有改动都以 KernelSU 源码内容探测为前提：上游补齐后自动跳过，重复执行幂等。
+注意：自 SUSFS 上游 b46a8dd0（2026-10-19）起，5.10/5.15/6.1/6.6/6.12 所有分支的
+主补丁都内联引用上述符号，因此裁剪对每个内核版本都会生效——不是 6.12 独有。
+
+所有改动都以 KernelSU 源码内容探测为前提：上游补齐后自动跳过，重复执行幂等；
+若内核侧自己定义了这些函数（旧形态主补丁），同样跳过，避免重定义。
 
 用法: ksu_susfs_hooks.py <KERNEL_ROOT>
 """
@@ -85,6 +89,14 @@ def rewrite(path: Path, sym: str, repl: tuple) -> bool:
     return True
 
 
+def kernel_defines(path: Path, sym: str) -> bool:
+    """内核侧自身是否定义了该函数（旧形态主补丁会内联定义，此时不能改名）。"""
+    if not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8", errors="surrogateescape")
+    return re.search(r"^static\s+[^\n;]*\b" + re.escape(sym) + r"\s*\(", text, re.M) is not None
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print("用法: ksu_susfs_hooks.py <KERNEL_ROOT>", file=sys.stderr)
@@ -107,6 +119,9 @@ def main() -> int:
         text = target.read_text(encoding="utf-8", errors="surrogateescape")
         if repl[0] not in text:
             continue  # 主补丁未引该符号（旧版形态），无需处理
+        if kernel_defines(target, sym):
+            print(f"{rel}: 内核侧已定义 {sym}，保留内联钩子")
+            continue
         if ksu_provides(ksu_dir, sym):
             print(f"{rel}: KernelSU 已提供 {sym}，保留内联钩子")
             continue
@@ -141,8 +156,13 @@ def main() -> int:
                 print("fs/exec.c: KernelSU 已提供 preinit 后端，保留钩子")
 
     if degraded:
-        print("::warning title=SUSFS 钩子已裁剪::当前 KernelSU 变体未提供 " + "/".join(degraded)
-              + "，对应 SELinux 属性隐藏与 preinit 功能在该内核上不生效（其余 SUSFS 功能正常）")
+        print(
+            "::warning title=SUSFS 内联钩子已按 KernelSU 能力裁剪::"
+            "上游主补丁（2026-10-19 起对所有内核分支生效）内联调用 "
+            + "/".join(degraded)
+            + "，当前 KernelSU 变体未提供这些全局符号；已回落到内核原生处理函数"
+            "并启用 KSU_NO_PREINIT，SELinux 属性隐藏与 preinit 不生效（其余 SUSFS 功能正常）"
+        )
     return 0
 
 
