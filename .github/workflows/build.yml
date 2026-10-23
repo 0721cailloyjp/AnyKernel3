@@ -635,10 +635,11 @@ jobs:
             echo "KSU_LATEST_COMMIT_DATE=未知" >> $GITHUB_ENV
           fi
 
-      # FinaSU master 在 susfs4ksu 官方集成补丁基准后有结构性提交，
-      # 上游 10_enable 补丁需配合本仓库维护的 drift-fixes 才能命中，
-      # 详见 scripts/finasu_compat/apply.sh 头部说明
-      - name: 应用 FinaSU 内核 SUSFS 集成补丁
+      # FinaSU 上游自 5b83330b（2026-10-23）起树内原生集成 SUSFS，官方要求
+      # 不再应用 susfs4ksu 的 10_enable 驱动侧补丁（会移出 tp_marker.o 等
+      # kprobe 模型仍需的编译单元，链接期 undefined symbol）；本步骤仅校验
+      # 原生集成结构，详见 scripts/finasu_compat/apply.sh 头部说明
+      - name: 校验 FinaSU 内核 SUSFS 原生集成
         if: inputs.ksu_variant == 'FinaSU' && inputs.enable_susfs
         working-directory: ${{ env.KERNEL_ROOT }}
         run: bash "$GITHUB_WORKSPACE/scripts/finasu_compat/apply.sh" KernelSU

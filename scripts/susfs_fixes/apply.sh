@@ -21,7 +21,7 @@ case "$KSU_VARIANT" in
     echo "SukiSU/BakaSU 使用内置 SUSFS 支持"
     ;;
   "FinaSU")
-    echo "FinaSU 使用 susfs4ksu 官方内核侧集成补丁（10_enable + drift-fixes 已在前置步骤应用）"
+    echo "FinaSU 使用树内原生 SUSFS 集成（驱动侧无需补丁，前置步骤仅做结构校验），只应用内核侧主补丁"
     ;;
 esac
 
