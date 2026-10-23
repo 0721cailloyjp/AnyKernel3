@@ -245,85 +245,6 @@ python3 "$SCRIPT_DIR/normalize_trace_ctx.py" "$SUSFS_PATCH"
 
 patch -p1 < "$SUSFS_PATCH" || true
 
-# ==================== SukiSU builtin 新 selinux_hide 模型适配（services.c 跳板符号） ====================
-# SukiSU-Ultra builtin 2026-05-29 (5fb0c079) 同步 tiann/KernelSU 的 SELinux 新检测
-# 修复后，feature/selinux_hide.c 在 >=6.6 分支把 security_dump_masked_av_fn /
-# context_struct_compute_av_fn 声明为 extern 函数——上游预期由 services.c 补丁提供
-# 这两个跳板符号（builtin c32094a4 提交说明），但 SUSFS 主补丁只在 services.c 提供
-# my_security_compute_av_user，不含这两个符号，导致 6.6/6.12 全部 SUSFS 构建在
-# vmlinux 链接阶段报：
-#   ld.lld: error: undefined symbol: context_struct_compute_av_fn
-# 在 services.c 末尾补上两个跳板（对同名 static 函数的薄封装，与上游预期形态一致）；
-# 仅当检测到 builtin 的 extern 引用且 services.c 尚无跳板时追加，
-# 上游自行提供后按内容检测自动跳过，幂等。
-KSU_HIDE_FILE="$KERNEL_ROOT/KernelSU/kernel/feature/selinux_hide.c"
-SEC_SERVICES="security/selinux/ss/services.c"
-if [ -f "$KSU_HIDE_FILE" ] && grep -q 'extern void context_struct_compute_av_fn' "$KSU_HIDE_FILE" \
-  && [ -f "$SEC_SERVICES" ] && ! grep -q 'void context_struct_compute_av_fn(' "$SEC_SERVICES"; then
-  if ! grep -q 'static void context_struct_compute_av(' "$SEC_SERVICES"; then
-    echo "::error::services.c 缺少 static context_struct_compute_av，无法生成 SukiSU 跳板符号"
-    exit 1
-  fi
-  echo "补齐 SukiSU builtin selinux_hide 所需的 services.c 跳板符号..."
-  python3 - "$SEC_SERVICES" <<'PYEOF'
-import sys
-
-path = sys.argv[1]
-src = open(path, encoding="utf-8", errors="surrogateescape").read()
-if "void context_struct_compute_av_fn(" in src:
-    sys.exit(0)
-tramp = (
-    "\n"
-    "/* Trampolines for SukiSU-Ultra builtin selinux_hide (KSU_SUSFS builds):\n"
-    " * kernel/feature/selinux_hide.c (>=6.6 model) declares *_fn as extern;\n"
-    " * provide thin wrappers around the static implementations here. */\n"
-    "#ifdef CONFIG_KSU_SUSFS\n"
-    "void context_struct_compute_av_fn(struct policydb *policydb,\n"
-    "\t\t\t\t  struct context *scontext,\n"
-    "\t\t\t\t  struct context *tcontext,\n"
-    "\t\t\t\t  u16 tclass,\n"
-    "\t\t\t\t  struct av_decision *avd,\n"
-    "\t\t\t\t  struct extended_perms *xperms);\n"
-    "void context_struct_compute_av_fn(struct policydb *policydb,\n"
-    "\t\t\t\t  struct context *scontext,\n"
-    "\t\t\t\t  struct context *tcontext,\n"
-    "\t\t\t\t  u16 tclass,\n"
-    "\t\t\t\t  struct av_decision *avd,\n"
-    "\t\t\t\t  struct extended_perms *xperms)\n"
-    "{\n"
-    "\tcontext_struct_compute_av(policydb, scontext, tcontext, tclass, avd, xperms);\n"
-    "}\n"
-)
-if "static void security_dump_masked_av(" in src:
-    tramp += (
-        "\n"
-        "void security_dump_masked_av_fn(struct policydb *policydb,\n"
-        "\t\t\t\tstruct context *scontext,\n"
-        "\t\t\t\tstruct context *tcontext,\n"
-        "\t\t\t\tu16 tclass,\n"
-        "\t\t\t\tu32 permissions,\n"
-        "\t\t\t\tconst char *reason);\n"
-        "void security_dump_masked_av_fn(struct policydb *policydb,\n"
-        "\t\t\t\tstruct context *scontext,\n"
-        "\t\t\t\tstruct context *tcontext,\n"
-        "\t\t\t\tu16 tclass,\n"
-        "\t\t\t\tu32 permissions,\n"
-        "\t\t\t\tconst char *reason)\n"
-        "{\n"
-        "\tsecurity_dump_masked_av(policydb, scontext, tcontext, tclass, permissions, reason);\n"
-        "}\n"
-    )
-else:
-    print("::warning::services.c 缺少 static security_dump_masked_av，跳过对应跳板")
-tramp += "#endif /* CONFIG_KSU_SUSFS */\n"
-open(path, "w", encoding="utf-8", errors="surrogateescape").write(src + tramp)
-print("%s: appended *_fn trampolines" % path)
-PYEOF
-  grep -q 'void context_struct_compute_av_fn(' "$SEC_SERVICES" \
-    || { echo "::error::services.c 跳板符号追加后校验失败"; exit 1; }
-  echo "services.c: 已提供 context_struct_compute_av_fn / security_dump_masked_av_fn"
-fi
-
 # ==================== KernelSU 缺失的 SUSFS 内联钩子符号（6.6+/6.12 主补丁形态）====================
 # 6.6/6.12 主补丁在 security/selinux/{hooks,selinuxfs}.c 内联改写调用点，要求 KernelSU 侧
 # 以全局符号提供 my_setprocattr / my_write_context / my_write_access；并在 fs/exec.c 调用
@@ -681,31 +602,6 @@ PYEOF
       echo "::warning title=task_mmu 冲突::仍有未识别的 hunk，保留 .rej 供排查："
       echo "$UNKNOWN_HUNK"
     fi
-  fi
-fi
-
-# 为尚未提供 SU 会话 FD 接口的 SukiSU/BakaSU 恢复旧版 exec hook 行为
-EXEC_HELPER=""
-if [[ "$KSU_VARIANT" == SukiSU* || "$KSU_VARIANT" == "BakaSU" || "$KSU_VARIANT" == "FinaSU" ]]; then
-  if grep -qF 'ksu_install_su_fd();' fs/exec.c; then
-    EXEC_HELPER="ksu_install_su_fd"
-  elif grep -qF 'ksu_handle_post_execveat_sucompat(' fs/exec.c; then
-    EXEC_HELPER="ksu_handle_post_execveat_sucompat"
-  fi
-fi
-if [[ -n "$EXEC_HELPER" ]] \
-  && ! grep -RqsE --include='*.c' "^[[:space:]]*int[[:space:]]+${EXEC_HELPER}[[:space:]]*\(" "$KERNEL_ROOT/KernelSU/kernel"; then
-  echo "$KSU_VARIANT 尚未提供 $EXEC_HELPER，恢复旧版 exec hook"
-  sed -i '/^extern int ksu_install_su_fd(void);$/d' fs/exec.c
-  sed -i '/^extern int ksu_handle_post_execveat_sucompat(/,+1d' fs/exec.c
-  sed -i 's/is_su_session = !\(ksu_handle_execveat[^;]*;\)/\1/' fs/exec.c
-  sed -i '/^[[:space:]]*bool is_su_session = false;$/d' fs/exec.c
-  sed -i '/^[[:space:]]*if (unlikely(is_su_session && retval >= 0))$/,+1d' fs/exec.c
-  sed -i '/^[[:space:]]*if (unlikely(is_su_session))$/,+1d' fs/exec.c
-  sed -i '/^#ifdef CONFIG_KSU_SUSFS$/N;/^#ifdef CONFIG_KSU_SUSFS\n#endif \/\/ #ifdef CONFIG_KSU_SUSFS$/d' fs/exec.c
-  if grep -qE 'ksu_install_su_fd|ksu_handle_post_execveat_sucompat|is_su_session' fs/exec.c; then
-    echo "::error::$KSU_VARIANT exec hook 结构已变化，无法完成兼容修复"
-    exit 1
   fi
 fi
 
