@@ -16,12 +16,66 @@ cp "$SUSFS4KSU/kernel_patches/$SUSFS_PATCH" ./common/
 cp "$SUSFS4KSU"/kernel_patches/fs/* ./common/fs/
 cp "$SUSFS4KSU"/kernel_patches/include/linux/* ./common/include/linux/
 
+# FinaSU 上游自 cdf8711a + 5b83330b（2026-10-23）起树内原生集成 SUSFS，官方
+# docs/builtin-integration.md 明确要求**不要**应用 susfs4ksu 的
+# 10_enable_susfs_for_ksu.patch（该补丁面向上游 KernelSU 手动钩子模型，会把
+# hook/tp_marker.o 等编译单元移出 Kbuild，而 FinaSU 的 kprobe 模型仍引用这些
+# 符号，驱动侧一旦打补丁就会在 vmlinux 链接阶段报 undefined symbol）。
+# 至此 FinaSU 与 SukiSU/BakaSU 形态一致：驱动侧不打补丁；差异仅在于 FinaSU
+# 的原生集成较新，这里顺带校验其结构（内核侧 50_add 主补丁的内联钩子依赖
+# 这些入口点/符号），漂移时立即报错而不是静默退化。
+verify_finasu_native_susfs() {
+  local FINASU_KSU="$KERNEL_ROOT/KernelSU/kernel"
+  local OPT SYM
+
+  if [ ! -f "$FINASU_KSU/extension/susfs.c" ]; then
+    echo "::error::FinaSU 未包含原生 SUSFS 集成（缺少 KernelSU/kernel/extension/susfs.c）。" >&2
+    echo "::error::当前检出的 FinaSU 早于 5b83330b（2026-10-23），或上游结构再次变化；" >&2
+    echo "::error::旧的 10_enable 驱动侧补丁方案已随上游原生集成废弃，请确认 ksuCommit 指向最新 Release。" >&2
+    exit 1
+  fi
+
+  # Kconfig 自带完整 KSU_SUSFS 菜单（「添加 SUSFS 配置」写入的 CONFIG_KSU_SUSFS*
+  # 必须全部有对应定义，否则 olddefconfig 会静默丢弃）
+  for OPT in KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT \
+             KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+             KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP; do
+    grep -q "^config $OPT\$" "$FINASU_KSU/Kconfig" \
+      || { echo "::error::FinaSU Kconfig 缺少 config $OPT（上游结构可能已变化）" >&2; exit 1; }
+  done
+
+  # extension/susfs.c 提供 50_add 主补丁在 fs/exec.c 内联调用的全部入口点；
+  # ksu_susfs_hooks.py 靠源码探测这些符号，缺失时会静默退化，这里提前校验
+  for SYM in ksu_handle_execveat ksu_handle_execveat_sucompat ksu_handle_post_execveat_sucompat \
+             ksu_setup_preinit_file ksu_preinit_handle_post_execveat; do
+    grep -qE "^(int|void) $SYM\(" "$FINASU_KSU/extension/susfs.c" \
+      || { echo "::error::FinaSU extension/susfs.c 缺少全局入口点: $SYM" >&2; exit 1; }
+  done
+
+  # 三参数 SUSFS 实现（内核侧 kernel/sys.c 的 3 参调用依赖该签名）
+  grep -q '^int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid)$' "$FINASU_KSU/hook/setuid_hook.c" \
+    || { echo "::error::FinaSU setuid_hook.c 缺少三参数 ksu_handle_setresuid（上游结构可能已变化）" >&2; exit 1; }
+
+  # my_* 符号已全局导出（6.6/6.12 主补丁在 security/selinux/{hooks,selinuxfs}.c 内联调用）
+  for SYM in my_write_context my_write_access my_setprocattr; do
+    grep -qE "^(ssize_t|int) $SYM\(" "$FINASU_KSU/feature/selinux_hide.c" \
+      || { echo "::error::FinaSU selinux_hide.c 未全局导出 $SYM（SUSFS 内联 SELinux 钩子将无法链接）" >&2; exit 1; }
+  done
+
+  # susfs_init() 由驱动 init 原生调用
+  grep -q 'susfs_init();' "$FINASU_KSU/core/init.c" \
+    || { echo "::error::FinaSU init.c 未调用 susfs_init()（上游结构可能已变化）" >&2; exit 1; }
+
+  echo "FinaSU 原生 SUSFS 集成校验通过"
+}
+
 case "$KSU_VARIANT" in
   "SukiSU"|"BakaSU")
     echo "SukiSU/BakaSU 使用内置 SUSFS 支持"
     ;;
   "FinaSU")
-    echo "FinaSU 使用树内原生 SUSFS 集成（驱动侧无需补丁，前置步骤仅做结构校验），只应用内核侧主补丁"
+    echo "FinaSU 使用树内原生 SUSFS 集成（驱动侧不打补丁，形态同 SukiSU/BakaSU）"
+    verify_finasu_native_susfs
     ;;
 esac
 
